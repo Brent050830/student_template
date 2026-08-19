@@ -14,6 +14,8 @@ static float g_ntf_start_dist = 0.0f;
 static float g_ntf_temp = 0.0f;
 static float g_ntf_soc = 0.0f;
 static float g_ntf_energy = 0.0f;
+static unsigned long long g_total_final_candidates = 0u;
+static int g_max_final_candidates = 0;
 
 void EMS_HVBatt_getTempAvg(float *rty_getTempAvg) { *rty_getTempAvg = 0.0f; }
 void EMS_HVBatt_getTargetSOC(float *rty_getTargetSOC) { *rty_getTargetSOC = 65.0f; }
@@ -255,7 +257,8 @@ static int verify_random_cases(const char *input_path,
 }
 
 static int flush_case(FILE *out, int case_id, int start_case, int max_cases,
-                      int *written_count)
+                      int *written_count, int include_start_step,
+                      int exhaustive_only)
 {
     const float T_INIT_C = 0.0f;
     const float SOC_INIT = 0.65f;
@@ -270,14 +273,23 @@ static int flush_case(FILE *out, int case_id, int start_case, int max_cases,
     if (max_cases > 0 && *written_count >= max_cases)
         return 0;
 
-    label = optimize_preheat(T_INIT_C, SOC_INIT);
-    if (fprintf(out, "%d,%.3f,%.6f,%.6f,%.6f,%.6f\n",
-                case_id,
-                label.best_start_distance_km,
-                label.min_charge_s,
-                label.max_charge_s,
-                label.min_heat_kWh,
-                label.max_heat_kWh) < 0) {
+    label = exhaustive_only
+          ? optimize_preheat_exhaustive(T_INIT_C, SOC_INIT)
+          : optimize_preheat(T_INIT_C, SOC_INIT);
+    g_total_final_candidates +=
+        (unsigned long long)label.evaluated_final_candidates;
+    if (label.evaluated_final_candidates > g_max_final_candidates)
+        g_max_final_candidates = label.evaluated_final_candidates;
+    if ((include_start_step
+         ? fprintf(out, "%d,%d,%.3f,%.6f,%.6f,%.6f,%.6f\n",
+                   case_id, label.best_start_step,
+                   label.best_start_distance_km,
+                   label.min_charge_s, label.max_charge_s,
+                   label.min_heat_kWh, label.max_heat_kWh)
+         : fprintf(out, "%d,%.3f,%.6f,%.6f,%.6f,%.6f\n",
+                   case_id, label.best_start_distance_km,
+                   label.min_charge_s, label.max_charge_s,
+                   label.min_heat_kWh, label.max_heat_kWh)) < 0) {
         fprintf(stderr, "ERROR: failed writing case %d: %s\n",
                 case_id, strerror(errno));
         g_n_segs = 0;
@@ -304,6 +316,8 @@ int main(int argc, char **argv)
     int case_id = 0;
     int written_count = 0;
     int write_failed = 0;
+    int detailed_output = 0;
+    int exhaustive_only = 0;
 
     if (argc >= 2 && strcmp(argv[1], "--verify-random") == 0) {
         const char *verify_input =
@@ -315,14 +329,25 @@ int main(int argc, char **argv)
         return verify_random_cases(verify_input, verify_count, verify_seed);
     }
 
-    if (argc >= 2)
-        input_path = argv[1];
-    if (argc >= 3)
-        output_path = argv[2];
-    if (argc >= 4)
-        max_cases = atoi(argv[3]);
-    if (argc >= 5)
-        start_case = atoi(argv[4]);
+    if (argc >= 2 && strcmp(argv[1], "--search-only") == 0) {
+        detailed_output = 1;
+        if (argc >= 3) input_path = argv[2];
+        if (argc >= 4) output_path = argv[3];
+        if (argc >= 5) max_cases = atoi(argv[4]);
+        if (argc >= 6) start_case = atoi(argv[5]);
+    } else if (argc >= 2 && strcmp(argv[1], "--exhaustive-only") == 0) {
+        detailed_output = 1;
+        exhaustive_only = 1;
+        if (argc >= 3) input_path = argv[2];
+        if (argc >= 4) output_path = argv[3];
+        if (argc >= 5) max_cases = atoi(argv[4]);
+        if (argc >= 6) start_case = atoi(argv[5]);
+    } else {
+        if (argc >= 2) input_path = argv[1];
+        if (argc >= 3) output_path = argv[2];
+        if (argc >= 4) max_cases = atoi(argv[3]);
+        if (argc >= 5) start_case = atoi(argv[4]);
+    }
     if (start_case <= 0)
         start_case = 1;
 
@@ -341,9 +366,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (fprintf(out,
-        "case_id,best_start_distance_km,min_charge_s,max_charge_s,"
-        "min_heat_kWh,max_heat_kWh\n") < 0) {
+    if ((detailed_output
+         ? fprintf(out,
+             "case_id,best_start_step,best_start_distance_km,"
+             "min_charge_s,max_charge_s,min_heat_kWh,max_heat_kWh\n")
+         : fprintf(out,
+             "case_id,best_start_distance_km,min_charge_s,max_charge_s,"
+             "min_heat_kWh,max_heat_kWh\n")) < 0) {
         fprintf(stderr, "ERROR: failed writing CSV header: %s\n",
                 strerror(errno));
         fclose(out);
@@ -364,7 +393,8 @@ int main(int argc, char **argv)
             int status;
             ++case_id;
             status = flush_case(out, case_id, start_case, max_cases,
-                                &written_count);
+                                &written_count, detailed_output,
+                                exhaustive_only);
             if (status < 0) write_failed = 1;
             if (status <= 0)
                 break;
@@ -375,7 +405,8 @@ int main(int argc, char **argv)
         int status;
         ++case_id;
         status = flush_case(out, case_id, start_case, max_cases,
-                            &written_count);
+                            &written_count, detailed_output,
+                            exhaustive_only);
         if (status < 0) write_failed = 1;
     }
 
@@ -387,6 +418,12 @@ int main(int argc, char **argv)
     fclose(in);
 
     if (write_failed) return 1;
+    fprintf(stderr,
+            "candidate-stats: cases=%d total=%llu average=%.3f max=%d\n",
+            written_count, g_total_final_candidates,
+            written_count > 0
+                ? (double)g_total_final_candidates / written_count : 0.0,
+            g_max_final_candidates);
     fprintf(stderr, "done: %d cases -> %s\n", written_count, output_path);
     return 0;
 }

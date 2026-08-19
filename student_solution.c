@@ -152,10 +152,14 @@ static void load_nav_segments(void)
 #define FAST_DT_S          1.0f
 #define FINAL_DT_S         0.2f
 #define OUTER_UPDATE_S     1.0f
+#define MONOTONIC_PROBE_INTERVAL_S 10.0f
 #define COARSE_STEP_S     60.0f
+#define COARSE_REFINE_RADIUS_S 60.0f
 #define FINE_STEP_S        5.0f
-#define REFINE_COST_MARGIN 0.01f
-#define MAX_PARETO_REFINE  3
+#define REFINE_COST_MARGIN 0.03f
+#define MAX_PARETO_SLOPE_REPS 6
+#define MAX_PARETO_KNEE_REPS  6
+#define MIN_PARETO_REP_GAP_S 10.0f
 #define SCORE_EPS          1.0e-6f
 
 typedef struct { float temp_C; float soc; } BatteryState;
@@ -184,9 +188,11 @@ enum {
     CAND_MIN_CHARGE   = 1u << 1,
     CAND_MAX_CHARGE   = 1u << 2,
     CAND_LOCAL_CHARGE = 1u << 3,
-    CAND_PARETO       = 1u << 4,
-    CAND_LOCAL_SCORE  = 1u << 5,
-    CAND_ENDPOINT     = 1u << 6
+    CAND_LOCAL_SCORE  = 1u << 4,
+    CAND_ENDPOINT     = 1u << 5,
+    CAND_PARETO_NEIGHBOR = 1u << 6,
+    CAND_PARETO_SLOPE    = 1u << 7,
+    CAND_PARETO_KNEE     = 1u << 8
 };
 
 typedef struct {
@@ -249,6 +255,8 @@ typedef struct {
 } PreheatOptimizationResult;
 
 typedef struct { int start_step; int index; } TimeCandidateRef;
+typedef struct { int index; float x; float y; } ParetoPoint;
+typedef struct { int position; float merit; } ParetoProposal;
 typedef enum { BOUNDARY_T20, BOUNDARY_T25, BOUNDARY_SOC } BoundaryKind;
 
 /* 原二维 MAP、轴点和双线性插值算法保持不变。 */
@@ -608,36 +616,6 @@ static int evaluate_final_candidate(const RouteContext *context,
     }
 }
 
-static int evaluate_fast_candidate(const RouteContext *context,
-                                   int final_step, TimePool *pool)
-{
-    const float start_time =
-        baseline_step_time(&context->final, final_step);
-    int fast_step = (int)floorf(start_time / FAST_DT_S + 0.5f);
-    TimeCandidate candidate;
-    TimeRouteResult route;
-    if (fast_step < 0) fast_step = 0;
-    if (fast_step > context->fast.steps) fast_step = context->fast.steps;
-    route = simulate_heating_suffix(&context->fast, fast_step);
-    candidate.start_step = final_step;
-    candidate.start_distance_km =
-        remaining_distance_at_time(start_time, context->final.route_km);
-    candidate.heat_time_s = context->final.total_time_s - start_time;
-    candidate.temp_C = route.temp_C;
-    candidate.soc_pct = route.soc * 100.0f;
-    candidate.heat_kWh = (P_HEAT_MAX / 1000.0f) *
-                         candidate.heat_time_s / 3600.0f;
-    candidate.charge_s = estimate_charge_time(route.temp_C, route.soc);
-    candidate.cost = INFINITY;
-    candidate.feasible = route.temp_C >= T_OPT_LOW &&
-                         route.temp_C <= T_OPT_HIGH &&
-                         route.soc >= SOC_MIN;
-    candidate.level = TIME_LEVEL_COARSE;
-    candidate.refined_to_next = 0;
-    candidate.flags = 0u;
-    return time_pool_store(pool, &candidate);
-}
-
 static int boundary_condition(const TimeRouteResult *route,
                               BoundaryKind kind)
 {
@@ -700,7 +678,8 @@ static int final_boundary_condition(const RouteContext *context,
  */
 static int fast_boundary_trends_are_monotonic(const RouteContext *context)
 {
-    int probe_step = (int)(COARSE_STEP_S / FAST_DT_S + 0.5f);
+    int probe_step = (int)(MONOTONIC_PROBE_INTERVAL_S /
+                           FAST_DT_S + 0.5f);
     int seen_t20_false = 0;
     int seen_t25_true = 0;
     int seen_soc_true = 0;
@@ -933,7 +912,7 @@ static int time_candidate_in_bounds(const TimeCandidate *candidate,
            candidate->start_step <= bounds->latest_start_step;
 }
 
-/* 能耗边界直接取 t_min/t_max；候选池只统计充电时间边界。 */
+/* 时间边界提供能耗初值；全池可行候选可进一步校正四个归一化边界。 */
 static TimeScale score_time_pool(TimePool *pool,
                                  const FeasibleTimeBounds *bounds)
 {
@@ -943,9 +922,17 @@ static TimeScale score_time_pool(TimePool *pool,
     };
     for (int i = 0; i < pool->count; ++i) {
         TimeCandidate *candidate = &pool->data[i];
+        const unsigned int pending_extrema =
+            (!candidate->refined_to_next &&
+             candidate->level != TIME_LEVEL_FINAL)
+            ? candidate->flags & (CAND_MIN_CHARGE | CAND_MAX_CHARGE)
+            : 0u;
         candidate->cost = INFINITY;
-        candidate->flags = 0u;
+        /* 全局充电极值锚点必须走完下一层，避免重评分时被新点抢占。 */
+        candidate->flags = pending_extrema;
         if (!time_candidate_in_bounds(candidate, bounds)) continue;
+        scale.min_energy = fminf(scale.min_energy, candidate->heat_kWh);
+        scale.max_energy = fmaxf(scale.max_energy, candidate->heat_kWh);
         scale.min_charge = fminf(scale.min_charge, candidate->charge_s);
         scale.max_charge = fmaxf(scale.max_charge, candidate->charge_s);
         scale.valid = 1;
@@ -968,7 +955,205 @@ static TimeScale score_time_pool(TimePool *pool,
     return scale;
 }
 
-/* 排序后同时标记全局极值、局部极值、Pareto、端点和近优 score。 */
+static int compare_pareto_proposal(const void *lhs, const void *rhs)
+{
+    const ParetoProposal *a = (const ParetoProposal *)lhs;
+    const ParetoProposal *b = (const ParetoProposal *)rhs;
+    if (a->merit < b->merit) return -1;
+    if (a->merit > b->merit) return 1;
+    return (a->position > b->position) - (a->position < b->position);
+}
+
+/* 10 s 间隔只约束额外斜率/拐点代表，不参与任何强制保护标志。 */
+static int mark_extra_pareto_rep(
+    TimePool *pool, const ParetoPoint pareto[], int position,
+    unsigned int flag, int min_gap_steps,
+    int selected_steps[], int *selected_count)
+{
+    TimeCandidate *candidate = &pool->data[pareto[position].index];
+    const int step = candidate->start_step;
+    if ((candidate->flags & flag) != 0u) return 0;
+    for (int i = 0; i < *selected_count; ++i) {
+        if (selected_steps[i] == step) {
+            candidate->flags |= flag;
+            return 1;
+        }
+        if (abs(selected_steps[i] - step) < min_gap_steps)
+            return 0;
+    }
+    candidate->flags |= flag;
+    selected_steps[(*selected_count)++] = step;
+    return 1;
+}
+
+static void mark_pareto_representatives(
+    TimePool *pool, const TimeCandidateRef refs[], int count,
+    const TimeScale *scale)
+{
+    const float target_slope = -0.4f / 0.6f;
+    const float energy_range = scale->max_energy - scale->min_energy;
+    const float charge_range = scale->max_charge - scale->min_charge;
+    const int min_gap_steps = (int)(MIN_PARETO_REP_GAP_S /
+                                    FINAL_DT_S + 0.5f);
+    ParetoPoint *pareto = NULL;
+    ParetoProposal *proposals = NULL;
+    float *slopes = NULL;
+    int selected_steps[MAX_PARETO_SLOPE_REPS + MAX_PARETO_KNEE_REPS];
+    int selected_count = 0;
+    int pareto_count = 0;
+    float pareto_best_charge = INFINITY;
+    int pareto_best_position = -1;
+    float pareto_best_cost = INFINITY;
+
+    if (count <= 0) return;
+    pareto = (ParetoPoint *)malloc(sizeof(ParetoPoint) * (size_t)count);
+    proposals = (ParetoProposal *)malloc(
+        sizeof(ParetoProposal) * (size_t)count);
+    slopes = (float *)malloc(sizeof(float) * (size_t)count);
+    if (!pareto || !proposals || !slopes) goto cleanup;
+
+    /* 从低能耗端扫描；所有非支配点都保留在池中，但此处不直接给晋级标志。 */
+    for (int i = count - 1; i >= 0; --i) {
+        TimeCandidate *candidate = &pool->data[refs[i].index];
+        if (candidate->charge_s < pareto_best_charge - SCORE_EPS) {
+            ParetoPoint *point = &pareto[pareto_count++];
+            point->index = refs[i].index;
+            point->x = (energy_range > SCORE_EPS)
+                ? (candidate->heat_kWh - scale->min_energy) /
+                  energy_range : 0.0f;
+            point->y = (charge_range > SCORE_EPS)
+                ? (candidate->charge_s - scale->min_charge) /
+                  charge_range : 0.0f;
+            pareto_best_charge = candidate->charge_s;
+        }
+    }
+    if (pareto_count <= 0) goto cleanup;
+
+    /* Pareto 上的 score 最优点本身由近优规则保护；额外保护其直接邻居。 */
+    for (int i = 0; i < pareto_count; ++i) {
+        const float cost = pool->data[pareto[i].index].cost;
+        if (cost < pareto_best_cost - SCORE_EPS) {
+            pareto_best_cost = cost;
+            pareto_best_position = i;
+        }
+    }
+    if (pareto_best_position > 0)
+        pool->data[pareto[pareto_best_position - 1].index].flags |=
+            CAND_PARETO_NEIGHBOR;
+    if (pareto_best_position + 1 < pareto_count)
+        pool->data[pareto[pareto_best_position + 1].index].flags |=
+            CAND_PARETO_NEIGHBOR;
+
+    /* 中心差分（端点用相邻差分）估计归一化 Pareto 曲线斜率。 */
+    for (int i = 0; i < pareto_count; ++i) {
+        const int left = (i > 0) ? i - 1 : i;
+        const int right = (i + 1 < pareto_count) ? i + 1 : i;
+        const float dx = pareto[right].x - pareto[left].x;
+        slopes[i] = (right != left && fabsf(dx) > SCORE_EPS)
+                  ? (pareto[right].y - pareto[left].y) / dx : NAN;
+    }
+
+    {
+        int slope_selected = 0;
+        int proposal_count = 0;
+
+        /* 先强制保留斜率最接近 -2/3 的点。 */
+        for (int i = 0; i < pareto_count; ++i) {
+            if (!isfinite(slopes[i])) continue;
+            proposals[proposal_count].position = i;
+            proposals[proposal_count].merit =
+                fabsf(slopes[i] - target_slope);
+            ++proposal_count;
+        }
+        qsort(proposals, (size_t)proposal_count,
+              sizeof(ParetoProposal), compare_pareto_proposal);
+        if (proposal_count > 0 && mark_extra_pareto_rep(
+            pool, pareto, proposals[0].position, CAND_PARETO_SLOPE,
+            min_gap_steps, selected_steps, &selected_count))
+            ++slope_selected;
+
+        /* 再优先保留斜率从目标值两侧穿过的位置。 */
+        proposal_count = 0;
+        for (int i = 0; i + 1 < pareto_count; ++i) {
+            float left_delta;
+            float right_delta;
+            if (!isfinite(slopes[i]) || !isfinite(slopes[i + 1])) continue;
+            left_delta = slopes[i] - target_slope;
+            right_delta = slopes[i + 1] - target_slope;
+            if (left_delta * right_delta > 0.0f) continue;
+            proposals[proposal_count].position =
+                (fabsf(left_delta) <= fabsf(right_delta)) ? i : i + 1;
+            proposals[proposal_count].merit =
+                fminf(fabsf(left_delta), fabsf(right_delta));
+            ++proposal_count;
+        }
+        qsort(proposals, (size_t)proposal_count,
+              sizeof(ParetoProposal), compare_pareto_proposal);
+        for (int i = 0; i < proposal_count &&
+             slope_selected < MAX_PARETO_SLOPE_REPS; ++i) {
+            if (mark_extra_pareto_rep(
+                pool, pareto, proposals[i].position, CAND_PARETO_SLOPE,
+                min_gap_steps, selected_steps, &selected_count))
+                ++slope_selected;
+        }
+
+        /* 穿越点不足时，再按斜率接近程度补足代表点。 */
+        proposal_count = 0;
+        for (int i = 0; i < pareto_count; ++i) {
+            if (!isfinite(slopes[i])) continue;
+            proposals[proposal_count].position = i;
+            proposals[proposal_count].merit =
+                fabsf(slopes[i] - target_slope);
+            ++proposal_count;
+        }
+        qsort(proposals, (size_t)proposal_count,
+              sizeof(ParetoProposal), compare_pareto_proposal);
+        for (int i = 0; i < proposal_count &&
+             slope_selected < MAX_PARETO_SLOPE_REPS; ++i) {
+            if (mark_extra_pareto_rep(
+                pool, pareto, proposals[i].position, CAND_PARETO_SLOPE,
+                min_gap_steps, selected_steps, &selected_count))
+                ++slope_selected;
+        }
+    }
+
+    /* 曲率 1-cos(angle) 越大，越优先作为 Pareto 拐点代表。 */
+    {
+        int proposal_count = 0;
+        int knee_selected = 0;
+        for (int i = 1; i + 1 < pareto_count; ++i) {
+            const float v1x = pareto[i].x - pareto[i - 1].x;
+            const float v1y = pareto[i].y - pareto[i - 1].y;
+            const float v2x = pareto[i + 1].x - pareto[i].x;
+            const float v2y = pareto[i + 1].y - pareto[i].y;
+            const float norm1 = sqrtf(v1x * v1x + v1y * v1y);
+            const float norm2 = sqrtf(v2x * v2x + v2y * v2y);
+            float cos_angle;
+            if (norm1 <= SCORE_EPS || norm2 <= SCORE_EPS) continue;
+            cos_angle = (v1x * v2x + v1y * v2y) / (norm1 * norm2);
+            cos_angle = fmaxf(-1.0f, fminf(1.0f, cos_angle));
+            proposals[proposal_count].position = i;
+            proposals[proposal_count].merit = -(1.0f - cos_angle);
+            ++proposal_count;
+        }
+        qsort(proposals, (size_t)proposal_count,
+              sizeof(ParetoProposal), compare_pareto_proposal);
+        for (int i = 0; i < proposal_count &&
+             knee_selected < MAX_PARETO_KNEE_REPS; ++i) {
+            if (mark_extra_pareto_rep(
+                pool, pareto, proposals[i].position, CAND_PARETO_KNEE,
+                min_gap_steps, selected_steps, &selected_count))
+                ++knee_selected;
+        }
+    }
+
+cleanup:
+    free(slopes);
+    free(proposals);
+    free(pareto);
+}
+
+/* 排序后标记强制保护项和代表性 Pareto 晋级项。 */
 static int refresh_time_flags(TimePool *pool,
                               const FeasibleTimeBounds *bounds,
                               TimeScale *out_scale)
@@ -978,8 +1163,6 @@ static int refresh_time_flags(TimePool *pool,
     int count = 0;
     int best_index = -1;
     float best_cost = INFINITY;
-    float pareto_best_charge = INFINITY;
-    int pareto_count = 0;
 
     *out_scale = scale;
     if (!scale.valid) return -1;
@@ -1019,39 +1202,6 @@ static int refresh_time_flags(TimePool *pool,
     qsort(refs, (size_t)count, sizeof(TimeCandidateRef),
           compare_time_candidate_ref);
 
-    /* 从最少能耗端反向扫描：充电时间刷新下界的点即非支配点。 */
-    for (int i = count - 1; i >= 0; --i) {
-        TimeCandidate *candidate = &pool->data[refs[i].index];
-        if (candidate->charge_s < pareto_best_charge - SCORE_EPS) {
-            candidate->flags |= CAND_PARETO;
-            pareto_best_charge = candidate->charge_s;
-            ++pareto_count;
-        }
-    }
-    /*
-     * 平滑权衡段上几乎每个点都可能属于 Pareto 前沿。逐点展开会退化为
-     * 全区间穷举，因此均匀保留有限个前沿代表点；端点、极值、近优点和
-     * 局部最优仍由各自独立标志完整保护。
-    */
-    if (pareto_count > MAX_PARETO_REFINE) {
-        int ordinal = 0;
-        for (int i = count - 1; i >= 0; --i) {
-            TimeCandidate *candidate = &pool->data[refs[i].index];
-            int keep = 0;
-            if ((candidate->flags & CAND_PARETO) == 0u) continue;
-            for (int slot = 0; slot < MAX_PARETO_REFINE; ++slot) {
-                const int target = (slot * (pareto_count - 1) +
-                                   (MAX_PARETO_REFINE - 1) / 2) /
-                                   (MAX_PARETO_REFINE - 1);
-                if (ordinal == target) {
-                    keep = 1;
-                    break;
-                }
-            }
-            if (!keep) candidate->flags &= ~CAND_PARETO;
-            ++ordinal;
-        }
-    }
     for (int i = 1; i + 1 < count; ++i) {
         TimeCandidate *candidate = &pool->data[refs[i].index];
         const TimeCandidate *left = &pool->data[refs[i - 1].index];
@@ -1065,6 +1215,7 @@ static int refresh_time_flags(TimePool *pool,
             candidate->cost <= right->cost + SCORE_EPS)
             candidate->flags |= CAND_LOCAL_SCORE;
     }
+    mark_pareto_representatives(pool, refs, count, &scale);
     free(refs);
     return best_index;
 }
@@ -1082,10 +1233,17 @@ static void add_precise_range(const RouteContext *context, TimePool *pool,
 
 static PreheatOptimizationResult empty_preheat_result(void)
 {
-    PreheatOptimizationResult result = {
-        0, -1, NAN, NAN, NAN, NAN, NAN,
-        NAN, NAN, NAN, NAN, 0
-    };
+    PreheatOptimizationResult result = {0};
+    result.best_start_step = -1;
+    result.best_start_distance_km = NAN;
+    result.T_end_C = NAN;
+    result.SOC_end_pct = NAN;
+    result.E_heat_kWh = NAN;
+    result.charge_time_s = NAN;
+    result.min_charge_s = NAN;
+    result.max_charge_s = NAN;
+    result.min_heat_kWh = NAN;
+    result.max_heat_kWh = NAN;
     return result;
 }
 
@@ -1095,19 +1253,17 @@ static PreheatOptimizationResult optimize_preheat(float T_init,
     PreheatOptimizationResult result = empty_preheat_result();
     RouteContext context;
     TimePool final_pool = {0};
-    TimePool coarse_pool = {0};
     FeasibleTimeBounds bounds;
     TimeScale final_scale;
-    TimeScale coarse_scale;
     int best_index;
     int coarse_step = (int)(COARSE_STEP_S / FINAL_DT_S + 0.5f);
+    int coarse_radius = (int)(COARSE_REFINE_RADIUS_S /
+                              FINAL_DT_S + 0.5f);
     int fine_step = (int)(FINE_STEP_S / FINAL_DT_S + 0.5f);
 
     if (!build_route_context(&context, T_init, SOC_init)) return result;
-    if (!time_pool_init(&final_pool, context.final.steps) ||
-        !time_pool_init(&coarse_pool, context.final.steps)) {
+    if (!time_pool_init(&final_pool, context.final.steps)) {
         time_pool_free(&final_pool);
-        time_pool_free(&coarse_pool);
         free_route_context(&context);
         return result;
     }
@@ -1119,32 +1275,14 @@ static PreheatOptimizationResult optimize_preheat(float T_init,
     evaluate_final_candidate(&context, bounds.latest_start_step,
                              TIME_LEVEL_FINE, &final_pool);
     if (coarse_step < 1) coarse_step = 1;
+    if (coarse_radius < 1) coarse_radius = 1;
     if (fine_step < 1) fine_step = 1;
     for (int step = bounds.earliest_start_step;
          step <= bounds.latest_start_step; step += coarse_step)
-        evaluate_fast_candidate(&context, step, &coarse_pool);
-    evaluate_fast_candidate(&context, bounds.latest_start_step, &coarse_pool);
-
-    best_index = refresh_time_flags(&coarse_pool, &bounds, &coarse_scale);
-    if (best_index < 0) {
-        /* 1 s 近似可能抹掉极窄区间，此时粗点全部进入补搜。 */
-        for (int i = 0; i < coarse_pool.count; ++i)
-            coarse_pool.data[i].flags |= CAND_ENDPOINT;
-    }
-
-    /*
-     * 1 s 粗搜只决定精确锚点的加入顺序。全部粗搜锚点随后都用 0.2 s
-     * 重算并进入统一池，避免未入选粗点永远失去重新晋级机会。
-     */
-    for (int pass = 0; pass < 2; ++pass) {
-        for (int i = 0; i < coarse_pool.count; ++i) {
-            const TimeCandidate *coarse = &coarse_pool.data[i];
-            const int initially_selected = coarse->flags != 0u;
-            if ((pass == 0) != initially_selected) continue;
-            evaluate_final_candidate(&context, coarse->start_step,
-                                     TIME_LEVEL_COARSE, &final_pool);
-        }
-    }
+        evaluate_final_candidate(&context, step,
+                                 TIME_LEVEL_COARSE, &final_pool);
+    evaluate_final_candidate(&context, bounds.latest_start_step,
+                             TIME_LEVEL_COARSE, &final_pool);
 
     /*
      * 每轮只晋升一级：粗搜锚点先展开 5 s 细搜，细搜候选才能展开
@@ -1168,7 +1306,7 @@ static PreheatOptimizationResult optimize_preheat(float T_init,
             const int center_step = candidate->start_step;
             const TimeSearchLevel level = candidate->level;
             const int radius = (level == TIME_LEVEL_COARSE)
-                             ? (2 * coarse_step + 2) / 3 : fine_step;
+                             ? coarse_radius : fine_step;
             const int sample_step = (level == TIME_LEVEL_COARSE)
                                   ? fine_step : 1;
             const TimeSearchLevel next_level =
@@ -1177,8 +1315,10 @@ static PreheatOptimizationResult optimize_preheat(float T_init,
             int low = center_step - radius;
             int high = center_step + radius;
             candidate->refined_to_next = 1;
-            if (low < bounds.earliest_start_step) low = bounds.earliest_start_step;
-            if (high > bounds.latest_start_step) high = bounds.latest_start_step;
+            if (low < bounds.earliest_start_step)
+                low = bounds.earliest_start_step;
+            if (high > bounds.latest_start_step)
+                high = bounds.latest_start_step;
             add_precise_range(&context, &final_pool, low, high,
                               sample_step, next_level);
             if (level == TIME_LEVEL_COARSE) {
@@ -1201,13 +1341,12 @@ static PreheatOptimizationResult optimize_preheat(float T_init,
         result.charge_time_s = best->charge_s;
         result.min_charge_s = final_scale.min_charge;
         result.max_charge_s = final_scale.max_charge;
-        result.min_heat_kWh = bounds.min_heat_kWh;
-        result.max_heat_kWh = bounds.max_heat_kWh;
-        result.evaluated_final_candidates = final_pool.count;
+        result.min_heat_kWh = final_scale.min_energy;
+        result.max_heat_kWh = final_scale.max_energy;
     }
 
 cleanup:
-    time_pool_free(&coarse_pool);
+    result.evaluated_final_candidates = final_pool.count;
     time_pool_free(&final_pool);
     free_route_context(&context);
     return result;
@@ -1244,11 +1383,11 @@ static PreheatOptimizationResult optimize_preheat_exhaustive(
             result.charge_time_s = best->charge_s;
             result.min_charge_s = scale.min_charge;
             result.max_charge_s = scale.max_charge;
-            result.min_heat_kWh = bounds.min_heat_kWh;
-            result.max_heat_kWh = bounds.max_heat_kWh;
-            result.evaluated_final_candidates = pool.count;
+            result.min_heat_kWh = scale.min_energy;
+            result.max_heat_kWh = scale.max_energy;
         }
     }
+    result.evaluated_final_candidates = pool.count;
     time_pool_free(&pool);
     free_route_context(&context);
     return result;
